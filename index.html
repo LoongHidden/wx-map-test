@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>小区路网打点生成器（高德版，含定位） - pmea</title>
+
+  <script src="https://webapi.amap.com/maps?v=2.0&key=d08b062133f21fe1bdf7de55d110fc14"></script>
+
+  <style>
+    :root{ --bg:#f5f7fb; --panel:#ffffff; --primary:#2f7cf6; --danger:#e24646; --text:#1d2533; --muted:#697383; --line:#dfe7f4; }
+    *{box-sizing:border-box} html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+    body{display:flex;flex-direction:column}
+    .topbar{display:flex;align-items:center;padding:10px 12px;background:var(--panel);border-bottom:1px solid var(--line);gap:8px;flex-wrap:wrap}
+    .group{display:flex;gap:8px;flex-wrap:wrap}
+    button,select,input{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:white;font-size:14px}
+    button{cursor:pointer;transition:.15s ease}
+    button:hover{transform:translateY(-1px);box-shadow:0 2px 6px rgba(0,0,0,.05)}
+    .primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+    .danger{background:var(--danger);color:#fff;border-color:var(--danger)}
+    .panel{padding:12px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+    .panel .inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    #map{flex:1;min-height:420px}
+    .badge{display:inline-block;font-size:12px;color:var(--muted);padding:4px 8px;border-radius:999px;background:#eef4ff;border:1px solid #dfeaff}
+    .footer-mini{font-size:12px;color:var(--muted);padding:8px 12px;border-top:1px solid var(--line);background:white}
+    @media(max-width:700px){.topbar,.panel{padding:8px}.node-list{width:100%}}
+    .amap-info-item{font-size:13px;color:#333}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="group">
+      <select id="nodeType">
+        <option value="entrance">入口</option>
+        <option value="junction" selected>路口/转角</option>
+        <option value="turn">拐弯</option>
+        <option value="house">门牌点</option>
+      </select>
+      <button id="addModeBtn" class="primary">添加节点</button>
+      <button id="connectModeBtn">连线</button>
+      <button id="locateBtn">定位并添加节点</button>
+    </div>
+    <div class="group">
+      <button id="saveBtn">保存</button>
+      <button id="exportBtn" class="primary">导出 JSON</button>
+      <button id="importBtn">导入 JSON</button>
+      <input id="importInput" type="file" accept=".json" style="display:none" />
+      <button id="resetBtn" class="danger">清空</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="inline">
+      <label for="houseNo">门牌号</label>
+      <input id="houseNo" type="text" placeholder="如：12号、A栋12号" />
+      <button id="attachHouseBtn">绑定门牌到当前点</button>
+    </div>
+
+    <div class="inline">
+      <label for="nodeName">节点名</label>
+      <input id="nodeName" type="text" placeholder="如：入口A、转角1" />
+      <button id="renameNodeBtn">保存节点名</button>
+    </div>
+
+    <div class="inline">
+      <label for="imageInput">补充图片</label>
+      <input id="imageInput" type="file" accept="image/*" />
+      <button id="deleteNodeBtn" class="danger">删除当前点</button>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <div class="footer-mini">
+    <span class="badge" id="statsBadge">0 个节点 / 0 条边</span>
+    说明：当前模式决定点击地图时的行为。添加节点后可切到“连线”模式，点击两个节点自动生成边。
+  </div>
+
+  <script>
+    const STORAGE_KEY = 'community_path_editor_state_amap_loc_v1';
+    const defaultCenter = [121.4737, 31.2304];
+    const map = new AMap.Map('map', { zoom: 17, center: defaultCenter, viewMode: '2D' });
+
+    const state = { nodes: [], edges: [], houses: [], selectedNodeId: null, mode: 'add', firstConnectNodeId: null };
+
+    const nodeTypeEl = document.getElementById('nodeType');
+    const houseNoEl = document.getElementById('houseNo');
+    const nodeNameEl = document.getElementById('nodeName');
+    const statsBadgeEl = document.getElementById('statsBadge');
+    const imageInputEl = document.getElementById('imageInput');
+    const locateBtn = document.getElementById('locateBtn');
+
+    let currentLocationMarker = null;
+    let currentLocationCircle = null;
+
+    function uid(prefix='id'){ return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2,9)}`; }
+    function haversineKm(lat1, lon1, lat2, lon2){
+      const R=6371; const dLat=(lat2-lat1)*Math.PI/180; const dLon=(lon2-lon1)*Math.PI/180;
+      const a=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)*Math.sin(dLon/2);
+      const c=2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a)); return R*c*1000;
+    }
+
+    function loadState(){
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if(raw) {
+        try {
+          const data = JSON.parse(raw);
+          state.nodes = Array.isArray(data.nodes)?data.nodes:[]; state.edges = Array.isArray(data.edges)?data.edges:[]; state.houses = Array.isArray(data.houses)?data.houses:[]; state.selectedNodeId = data.selectedNodeId||null; state.mode = data.mode||'add';
+        } catch(e){ console.warn('加载本地数据失败', e); }
+      }
+    }
+    function saveState(){ localStorage.setItem(STORAGE_KEY, JSON.stringify({nodes:state.nodes, edges:state.edges, houses:state.houses, selectedNodeId:state.selectedNodeId, mode:state.mode})); }
+
+    function getNodeById(id){ return state.nodes.find(n=>n.id===id)||null; }
+    function setSelectedNode(nodeId){ state.selectedNodeId = nodeId; const node = getNodeById(nodeId); if(!node) return; houseNoEl.value = node.house_no||''; nodeNameEl.value = node.name||''; renderAll(); saveState(); }
+    function getNodeColor(type){ if(type==='entrance') return '#22a06b'; if(type==='turn') return '#f59e0b'; if(type==='house') return '#ef5b9d'; return '#4f7cff'; }
+
+    function clearMapObjects(){
+      state.nodes.forEach(n => { if(n._marker){ n._marker.setMap(null); n._marker = null; } });
+      state.edges.forEach(e => { if(e._polyline){ e._polyline.setMap(null); e._polyline = null; } });
+    }
+
+    function drawEdges(){
+      state.edges.forEach(edge => {
+        const a = getNodeById(edge.from), b = getNodeById(edge.to); if(!a||!b) return;
+        const path = [[a.lng,a.lat],[b.lng,b.lat]];
+        const polyline = new AMap.Polyline({ path, showDir:false, strokeWeight:4, strokeColor:'#3b82f6', strokeOpacity:0.9 });
+        polyline.setMap(map); edge._polyline = polyline;
+        polyline.on('click', () => {
+          const mid = [(a.lng+b.lng)/2, (a.lat+b.lat)/2];
+          const info = new AMap.InfoWindow({ content:`<div class="amap-info-item">长度约 ${Math.round(edge.length_m)} 米</div>`, offset: new AMap.Pixel(0,-10) });
+          info.open(map, mid);
+        });
+      });
+    }
+
+    function drawNodes(){
+      state.nodes.forEach(node => {
+        if(node._marker){ node._marker.setMap(null); node._marker = null; }
+        const color = getNodeColor(node.type);
+        const html = `<div style="width:18px;height:18px;border-radius:50%;background:${color};border:2px solid #fff;box-shadow:0 1px 2px rgba(0,0,0,0.15)" title="${node.name||node.type}"></div>`;
+        const marker = new AMap.Marker({ position: [node.lng, node.lat], content: html, anchor: 'center' });
+        marker.setMap(map);
+        marker.on('click', () => {
+          setSelectedNode(node.id);
+          const info = new AMap.InfoWindow({ content:`<div style="min-width:160px"><b>${node.name||node.type}</b><br>类型：${node.type}<br>坐标：${node.lat.toFixed(6)}, ${node.lng.toFixed(6)}<br>图片：${(node.images||[]).length} 张</div>`, offset: new AMap.Pixel(0,-10) });
+          info.open(map, [node.lng, node.lat]);
+        });
+        node._marker = marker;
+      });
+    }
+
+    function updateStats(){ statsBadgeEl.textContent = `${state.nodes.length} 个节点 / ${state.edges.length} 条边`; }
+    function renderAll(){ clearMapObjects(); drawEdges(); drawNodes(); updateStats(); highlightSelectedNode(); renderInspector(); }
+    function highlightSelectedNode(){ const node = getNodeById(state.selectedNodeId); if(!node) return; map.setCenter([node.lng, node.lat]); }
+    function renderInspector(){ const node = getNodeById(state.selectedNodeId); if(!node){ houseNoEl.value=''; nodeNameEl.value=''; return; } houseNoEl.value=node.house_no||''; nodeNameEl.value=node.name||''; }
+
+    function addNode(lat, lng, type=nodeTypeEl.value, name=''){
+      const node = { id:uid('node'), type, lat, lng, name: name||`${type==='house'?'门牌点':'节点'}-${state.nodes.length+1}`, images: [], house_no:'' };
+      state.nodes.push(node); setSelectedNode(node.id); saveState(); renderAll();
+    }
+
+    function addEdge(fromNodeId, toNodeId){
+      if(!fromNodeId||!toNodeId||fromNodeId===toNodeId) return;
+      const exists = state.edges.some(e => (e.from===fromNodeId&&e.to===toNodeId)||(e.from===toNodeId&&e.to===fromNodeId));
+      if(exists) return;
+      const a=getNodeById(fromNodeId), b=getNodeById(toNodeId); const length_m = haversineKm(a.lat,a.lng,b.lat,b.lng);
+      const edge = { id:uid('edge'), from:fromNodeId, to:toNodeId, length_m, images:[] };
+      state.edges.push(edge); saveState(); renderAll();
+    }
+
+    function deleteSelectedNode(){ if(!state.selectedNodeId) return; const id=state.selectedNodeId; state.nodes = state.nodes.filter(n=>n.id!==id); state.edges = state.edges.filter(e=>e.from!==id&&e.to!==id); state.houses = state.houses.filter(h=>h.nodeId!==id); state.selectedNodeId = state.nodes[0]?.id || null; saveState(); renderAll(); }
+
+    function attachHouseToSelectedNode(){ const node = getNodeById(state.selectedNodeId); if(!node){ alert('请先选中一个节点'); return; } const houseNo = houseNoEl.value.trim(); if(!houseNo){ alert('请输入门牌号'); return; } node.house_no = houseNo; node.name = node.name || houseNo; state.houses = state.houses.filter(h=>h.nodeId!==node.id); state.houses.push({ id: uid('house'), nodeId: node.id, house_no: houseNo }); saveState(); renderAll(); }
+
+    function renameSelectedNode(){ const node = getNodeById(state.selectedNodeId); if(!node){ alert('请先选中节点'); return; } const name = nodeNameEl.value.trim(); if(!name){ alert('请输入节点名称'); return; } node.name = name; saveState(); renderAll(); }
+
+    function readAsDataURL(file){ return new Promise((resolve,reject)=>{ const reader=new FileReader(); reader.onload=()=>resolve(reader.result); reader.onerror=reject; reader.readAsDataURL(file); }); }
+
+    async function attachImageToSelectedNode(){ const node = getNodeById(state.selectedNodeId); if(!node){ alert('请先选中节点'); return; } const file = imageInputEl.files[0]; if(!file){ alert('请选择图片文件'); return; } const dataUrl = await readAsDataURL(file); const caption = prompt('请输入图片说明（可为空）','关键路口/拐弯图片') || '关键位置图片'; node.images = node.images || []; node.images.push({ id: uid('img'), dataUrl, caption, uploadedAt: new Date().toISOString() }); saveState(); renderAll(); alert('图片已保存到当前节点（本地）。'); }
+
+    function exportJson(){ const payload={ version:1, exportedAt:new Date().toISOString(), nodes: state.nodes.map(n=>({ id:n.id, type:n.type, lat:n.lat, lng:n.lng, name:n.name, house_no:n.house_no||'', images:n.images||[] })), edges: state.edges.map(e=>({ id:e.id, from:e.from, to:e.to, length_m:e.length_m, images:e.images||[] })), houses: state.houses }; const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='community_path_data_amap_loc.json'; a.click(); URL.revokeObjectURL(a.href); }
+
+    function importJson(file){ const reader=new FileReader(); reader.onload=function(e){ try{ const data=JSON.parse(e.target.result); if(!data||!Array.isArray(data.nodes)||!Array.isArray(data.edges)) throw new Error('JSON 格式不正确'); state.nodes = data.nodes.map(n=>({...n, images: Array.isArray(n.images)?n.images:[], house_no: n.house_no||'' })); state.edges = data.edges.map(e=>({...e, images: Array.isArray(e.images)?e.images:[] })); state.houses = Array.isArray(data.houses)?data.houses:[]; state.selectedNodeId = state.nodes[0]?.id || null; saveState(); renderAll(); alert('导入成功'); }catch(err){ alert('导入失败：'+err.message); } }; reader.readAsText(file); }
+
+    function resetAll(){ const ok = confirm('确认清空所有路网数据？'); if(!ok) return; state.nodes=[]; state.edges=[]; state.houses=[]; state.selectedNodeId=null; state.mode='add'; localStorage.removeItem(STORAGE_KEY); renderAll(); }
+
+    function setMode(mode){ state.mode = mode; const addBtn=document.getElementById('addModeBtn'), connectBtn=document.getElementById('connectModeBtn'); if(mode==='add'){ addBtn.classList.add('primary'); connectBtn.classList.remove('primary'); } else { addBtn.classList.remove('primary'); connectBtn.classList.add('primary'); } }
+
+    map.on('click', function(e){
+      const lng = e.lnglat.lng, lat = e.lnglat.lat;
+      if(state.mode === 'add'){ addNode(lat, lng, nodeTypeEl.value, nodeNameEl.value.trim() || ''); }
+      else if(state.mode === 'connect'){
+        if(!state.selectedNodeId){ alert('请先选中一个节点'); return; }
+        if(!state.firstConnectNodeId){ state.firstConnectNodeId = state.selectedNodeId; alert('已选择第一个节点，点击第二个节点建立边'); return; }
+        if(state.firstConnectNodeId === state.selectedNodeId){ alert('不能连接同一个节点'); return; }
+        addEdge(state.firstConnectNodeId, state.selectedNodeId);
+        state.firstConnectNodeId = null;
+        alert('边已创建');
+      }
+    });
+
+    document.getElementById('addModeBtn').addEventListener('click', ()=>setMode('add'));
+    document.getElementById('connectModeBtn').addEventListener('click', ()=>setMode('connect'));
+    document.getElementById('saveBtn').addEventListener('click', saveState);
+    document.getElementById('exportBtn').addEventListener('click', exportJson);
+    document.getElementById('resetBtn').addEventListener('click', resetAll);
+    document.getElementById('attachHouseBtn').addEventListener('click', attachHouseToSelectedNode);
+    document.getElementById('renameNodeBtn').addEventListener('click', renameSelectedNode);
+    document.getElementById('deleteNodeBtn').addEventListener('click', deleteSelectedNode);
+    imageInputEl.addEventListener('change', attachImageToSelectedNode);
+    document.getElementById('importBtn').addEventListener('click', ()=>document.getElementById('importInput').click());
+    document.getElementById('importInput').addEventListener('change', function(e){ const file = e.target.files[0]; if(file) importJson(file); e.target.value=''; });
+
+    loadState(); setMode('add'); renderAll();
+
+    async function tryGeolocateAndCenter(){
+      if(navigator.geolocation){
+        try {
+          const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 8000 }));
+          const lat = pos.coords.latitude, lng = pos.coords.longitude;
+          setCurrentLocation(lng, lat);
+          map.setCenter([lng, lat]);
+          return;
+        } catch(err){ console.warn('浏览器定位失败或未授权：', err); }
+      }
+
+      try {
+        AMap.plugin('AMap.Geolocation', function(){
+          const geolocation = new AMap.Geolocation({ enableHighAccuracy: true, timeout: 8000, zoomToAccuracy: false });
+          geolocation.getCurrentPosition(function(status, result){
+            if(status === 'complete' && result && result.position){
+              const [lng, lat] = result.position;
+              setCurrentLocation(lng, lat);
+              map.setCenter([lng, lat]);
+            } else { console.warn('高德定位未成功：', result); }
+          });
+        });
+      } catch(e){ console.warn('高德定位插件调用失败', e); }
+    }
+
+    function setCurrentLocation(lng, lat){
+      if(currentLocationMarker){ currentLocationMarker.setMap(null); currentLocationMarker = null; }
+      if(currentLocationCircle){ currentLocationCircle.setMap(null); currentLocationCircle = null; }
+      const html = `<div style="width:18px;height:18px;border-radius:50%;background:#007bff;border:2px solid rgba(255,255,255,0.9);box-shadow:0 1px 2px rgba(0,0,0,0.15)"></div>`;
+      currentLocationMarker = new AMap.Marker({ position:[lng,lat], content:html, anchor:'center' });
+      currentLocationMarker.setMap(map);
+      currentLocationCircle = new AMap.Circle({ center:[lng,lat], radius:10, strokeColor:'#006cff', strokeOpacity:0.25, fillColor:'#bfe1ff', fillOpacity:0.15 });
+      currentLocationCircle.setMap(map);
+    }
+
+    locateBtn.addEventListener('click', async () => {
+      locateBtn.disabled = true;
+      locateBtn.textContent = '定位中...';
+      try {
+        let latlng = null;
+        if(navigator.geolocation){
+          try {
+            const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 12000 }));
+            latlng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          } catch(err){ console.warn('浏览器定位失败或未授权：', err); }
+        }
+        if(!latlng){
+          await new Promise((resolve) => {
+            try {
+              AMap.plugin('AMap.Geolocation', function(){
+                const geolocation = new AMap.Geolocation({ enableHighAccuracy: true, timeout: 12000, zoomToAccuracy: false });
+                geolocation.getCurrentPosition(function(status,result){
+                  if(status === 'complete' && result && result.position){
+                    const [lng, lat] = result.position;
+                    latlng = { lat, lng };
+                  } else { console.warn('高德定位结果：', result); }
+                  resolve();
+                });
+              });
+            } catch(e){ console.warn('高德定位插件异常', e); resolve(); }
+          });
+        }
+        if(latlng){
+          setCurrentLocation(latlng.lng, latlng.lat);
+          map.setCenter([latlng.lng, latlng.lat]);
+          addNode(latlng.lat, latlng.lng, nodeTypeEl.value, nodeNameEl.value.trim() || '');
+          alert('已在当前位置添加一个节点，请检查并补充名称/门牌信息。');
+        } else {
+          alert('无法获取当前位置。请确认页面为 HTTPS（iOS Safari 需要 HTTPS 定位授权），或在地图上手动点击添加节点。');
+        }
+      } finally {
+        locateBtn.disabled = false;
+        locateBtn.textContent = '定位并添加节点';
+      }
+    });
+
+    tryGeolocateAndCenter();
+  </script>
+</body>
+</html>
